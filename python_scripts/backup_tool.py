@@ -52,7 +52,15 @@ def extract_backup(backup_path, output_path, password=""):
         print "python keychain_tool.py -d \"%s\" \"%s\"" % (output_path + "/KeychainDomain/keychain-backup.plist", output_path + "/Manifest.plist")
 
     elif os.path.exists(backup_path + "/Manifest.db"):
+        
+        productVersionIos102 = False
+        productVersion = unicode(info.get("Product Version", "missing"))
+        if productVersion == "10.0.2":
+            productVersionIos102 = True
+        #print "Product Version 10.0.2 Detected? {}".format(productVersionIos102)
+                
         if 'ManifestKey' in manifest:
+            ios102 = True
             kb = Keybag.createWithBackupManifest(manifest, password, ios102=True)
         else:
             kb = Keybag.createWithBackupManifest(manifest, password)
@@ -69,7 +77,7 @@ def extract_backup(backup_path, output_path, password=""):
             wkey = manifest['ManifestKey'].data[4:]
             manifest_key = kb.unwrapKeyForClass(clas, wkey)
 
-        manifset_db = ManifestDB(backup_path, key=manifest_key)
+        manifset_db = ManifestDB(backup_path, key=manifest_key, ios102=productVersionIos102, backupPassword=password)
         manifset_db.keybag = kb
         manifset_db.extract_backup(output_path)
 

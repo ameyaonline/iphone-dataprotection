@@ -2,11 +2,16 @@ import os
 import re
 import sqlite3
 import plistlib
+import base64
+import binascii
 
 from Crypto.Cipher import AES
 
 from util import readPlist, makedirs, parsePlist
 from util import bplist
+from crypto.aes import ZEROIV, removePadding
+
+import hashlib
 
 def warn(msg):
     print "WARNING: %s" % msg
@@ -16,12 +21,36 @@ MASK_REGULAR_FILE = 0x8000
 MASK_DIRECTORY = 0x4000
 
 class MBFile(object):
-    def __init__(self, domain, relative_path, flags, file_blob):
+    def __init__(self, domain, relative_path, flags, file_blob, ios102=False, salt=None, passwordHash=None):
         self.domain = domain
         self.relative_path = relative_path
         self.flags = flags
-        self.file_info = parsePlist(str(file_blob))
 
+        # ===========================================================================================
+        # ios102 QUIRK
+        # ===========================================================================================
+        # This is in a weird format, where, blob is encrypted using 
+        # first 16 bytes of the password hash
+        # password_hash = SHA1( bytes(password) + bytes(salt) )
+        # In this case both salt and password_hash are stored in Properties table as key/value pairs
+        # key = 16 leading bytes of password_hash
+        file_blob_processed = file_blob
+        if ios102 and file_blob and not str(file_blob).startswith("bplist"):
+            fileInfoBlobEncryptionKey = passwordHash[:16]
+            
+            file_blob_processed = base64.b64decode(file_blob)
+            if len(str(file_blob_processed)) % 16:
+                raise Exception( "file_blob length is not a multiple of 16, cannot proceed" )
+            
+            initializationVector = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F"
+            aes = AES.new(fileInfoBlobEncryptionKey, AES.MODE_CBC, initializationVector)
+            file_blob_processed = aes.decrypt(file_blob_processed)
+            
+            # This data is padded, we need to fix that
+            file_blob_processed = removePadding(16, file_blob_processed)
+        
+#        print "\nProcessing: {}\nBLOB HEX:\n{}\nBLOB ASCII:\n{}\n".format( self.relative_path, binascii.hexlify(bytearray(file_blob_processed)), str(file_blob_processed) )
+        self.file_info = parsePlist(str(file_blob_processed))
         self._parse_file_info()
 
     def _parse_file_info(self):
@@ -80,7 +109,7 @@ class MBFile(object):
 
 
 class ManifestDB(object):
-    def __init__ (self, path, key=None):
+    def __init__ (self, path, key=None, ios102=False, backupPassword=None):
         self.files = {}
         self.backup_path = path
         self.keybag = None
@@ -98,6 +127,35 @@ class ManifestDB(object):
         try:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+          
+            # ===========================================================================================
+            # ios102 QUIRK
+            # ===========================================================================================
+            # Please refer to the notes above in initialization of MBFile
+            # We need two attributes named "salt" and "passwordHash" to decrypt the blob in file column
+            # It seems to be encrypted only for this release
+            salt = None
+            passwordHash = None
+            generatedPasswordHash = None
+            #print "Product Version 10.0.2 Detected? {}".format(ios102)
+            if ios102:
+                for record in cursor.execute("SELECT \"key\", \"value\" FROM Properties WHERE key IN ('salt', 'passwordHash')"):
+                    key = record[0]
+                    value = record[1]
+                    if key == "salt":
+                        salt = value
+                    if key == "passwordHash":
+                        passwordHash = value
+                        
+                if not salt:
+                    raise Exception("salt key/value is missing in Properties table of Manifest.db, it is essential in ios10.0.2 backup for decrypting plist in file column of Manifest.db")
+                if not passwordHash:
+                    raise Exception("passwordHash key/value is missing in Properties table of Manifest.db, it is essential in ios10.0.2 backup for decrypting plist in file column of Manifest.db")
+                if not backupPassword:
+                    raise Exception("This module needs backup password to proceed")
+                
+                fileInfoKeyPart = hashlib.sha1( backupPassword + str(salt) ).digest()
+                generatedPasswordHash = fileInfoKeyPart[:16]
 
             for record in cursor.execute("SELECT fileID, domain, relativePath, flags, file FROM Files"):
                 filename = record[0]
@@ -108,7 +166,8 @@ class ManifestDB(object):
                 if flags == 16:
                     warn("Flags == 16 for {0} {1} ({2})".format(domain, relative_path, file_blob))
                 else:
-                    self.files[filename] = MBFile(domain, relative_path, flags, file_blob)
+                    self.files[filename] = MBFile(domain, relative_path, flags, file_blob, ios102, salt, generatedPasswordHash)
+
 
         finally:
             conn.close()
